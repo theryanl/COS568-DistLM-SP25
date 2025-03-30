@@ -22,15 +22,16 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-import torch.distributed as dist
-
+from termcolor import colored
 # import a previous version of the HuggingFace Transformers package
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
@@ -71,17 +72,8 @@ def set_seed(args):
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
-    if args.world_size > 1:
-        # reduce the per device batch size, but not below 1
-        args.train_batch_size = args.per_device_train_batch_size // args.world_size
-        args.train_batch_size = max(args.train_batch_size, 1)
-    else:
-        args.train_batch_size = args.per_device_train_batch_size
-
-    if args.world_size > 1:
-        train_sampler = DistributedSampler(train_dataset, num_replicas = args.world_size, rank = args.local_rank)
-    else:
-        train_sampler = RandomSampler(train_dataset)
+    args.train_batch_size = args.per_device_train_batch_size
+    train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -120,8 +112,9 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    for epoch in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        
         for step, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -131,8 +124,10 @@ def train(args, train_dataset, model, tokenizer):
                       'labels':         batch[3]}
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
-            
-            if step < 5: print(f"minibatch {step + 1}: loss: {loss.item()}")
+
+            # Print loss for first five minibatches
+            if step < 5:
+                print(f"Minibatch {step+1}, Loss: {loss.item():.6f}")
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -147,28 +142,7 @@ def train(args, train_dataset, model, tokenizer):
                 loss.backward()
                 ##################################################
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-            # Add gradient synchronization here
-            if args.world_size > 1:
-                for param in model.parameters():
-                    if param.requires_grad and param.grad is not None:
-                        # lists to hold gradients
-                        to_gather = [torch.zeros_like(param.grad) for i in range(args.world_size)]
-                        
-                        # all gradients go to rank 0
-                        dist.gather(param.grad, to_gather if args.local_rank == 0 else None, dst=0)
-                        
-                        # average the gradients only at rank 0
-                        if args.local_rank == 0:
-                            avg_grad = torch.mean(torch.stack(to_gather), dim=0)
-                            scatter_list = [avg_grad for i in range(args.world_size)] # scatter to everyone
-                        else:
-                            scatter_list = None
-                        
-                        # Scatter the averaged gradients back to all processes
-                        dist.scatter(param.grad, scatter_list if args.local_rank == 0 else None, src=0)
-
-            tr_loss += loss.item()
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -177,10 +151,11 @@ def train(args, train_dataset, model, tokenizer):
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
-
+            
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+        
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -188,8 +163,8 @@ def train(args, train_dataset, model, tokenizer):
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
         evaluate(args, model, tokenizer)
-        ##################################################
-
+        ##################################################    
+    
     return global_step, tr_loss / global_step
 
 
@@ -380,9 +355,6 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
-    parser.add_argument("--master_ip", type=str)
-    parser.add_argument("--master_port", type=str)
-    parser.add_argument("--world_size", type=int, default=4)
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -402,17 +374,6 @@ def main():
     # Set seed
     set_seed(args)
 
-    # Initialize distributed environment FIRST before using any distributed functionality
-    print(f"Initializing distributed environment with rank {args.local_rank}")
-    if args.world_size > 1:
-        dist.init_process_group(
-            backend = 'gloo',  # for cpu
-            init_method = f"tcp://{args.master_ip}:{args.master_port}",
-            world_size = args.world_size, 
-            rank = args.local_rank
-        )
-    print(f"Initialized distributed environment with rank {args.local_rank}")
-
     # Prepare GLUE task
     args.task_name = args.task_name.lower()
     if args.task_name not in processors:
@@ -431,6 +392,9 @@ def main():
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
     
+    ##################################################
+    # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
+    # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
     ##################################################
 
@@ -440,6 +404,7 @@ def main():
     model.to(args.device)
 
     logger.info("Training/evaluation parameters %s", args)
+
 
     # Training
     if args.do_train:

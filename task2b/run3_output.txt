@@ -1,0 +1,5 @@
+Initializing distributed environment with rank 3
+Initialized distributed environment with rank 3
+Average time per iteration (excluding first): 9.468381 seconds
+Plotting loss curves...
+Step loss figure saved to /tmp/RTE/2b_step_loss_node_3.png

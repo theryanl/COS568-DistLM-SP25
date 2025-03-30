@@ -1,0 +1,6 @@
+Initializing distributed environment with rank 1
+Initialized distributed environment with rank 1
+Average time per iteration (excluding first): 12.058451 seconds
+Plotting loss curves...
+Epoch loss figure saved to /tmp/RTE/epoch_loss_node_1.png
+Step loss figure saved to /tmp/RTE/step_loss_node_1.png
