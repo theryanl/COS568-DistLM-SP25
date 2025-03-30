@@ -29,6 +29,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
+import torch.distributed as dist
 
 # import a previous version of the HuggingFace Transformers package
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
@@ -70,8 +71,17 @@ def set_seed(args):
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
-    args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    if args.world_size > 1:
+        # reduce the per device batch size, but not below 1
+        args.train_batch_size = args.per_device_train_batch_size // args.world_size
+        args.train_batch_size = max(args.train_batch_size, 1)
+    else:
+        args.train_batch_size = args.per_device_train_batch_size
+
+    if args.world_size > 1:
+        train_sampler = DistributedSampler(train_dataset, num_replicas = args.world_size, rank = args.local_rank)
+    else:
+        train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -121,6 +131,8 @@ def train(args, train_dataset, model, tokenizer):
                       'labels':         batch[3]}
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+            
+            if step < 5: print(f"minibatch {step + 1}: loss: {loss.item()}")
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -132,15 +144,35 @@ def train(args, train_dataset, model, tokenizer):
             else:
                 ##################################################
                 # TODO(cos568): perform backward pass here (expect one line of code)
-                
+                loss.backward()
                 ##################################################
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            # Add gradient synchronization here
+            if args.world_size > 1:
+                for param in model.parameters():
+                    if param.requires_grad and param.grad is not None:
+                        # lists to hold gradients
+                        to_gather = [torch.zeros_like(param.grad) for i in range(args.world_size)]
+                        
+                        # all gradients go to rank 0
+                        dist.gather(param.grad, to_gather if args.local_rank == 0 else None, dst=0)
+                        
+                        # average the gradients only at rank 0
+                        if args.local_rank == 0:
+                            avg_grad = torch.mean(torch.stack(to_gather), dim=0)
+                            scatter_list = [avg_grad for i in range(args.world_size)] # scatter to everyone
+                        else:
+                            scatter_list = None
+                        
+                        # Scatter the averaged gradients back to all processes
+                        dist.scatter(param.grad, scatter_list if args.local_rank == 0 else None, src=0)
 
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
-                
+                optimizer.step()
                 ##################################################
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
@@ -155,7 +187,7 @@ def train(args, train_dataset, model, tokenizer):
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-
+        evaluate(args, model, tokenizer)
         ##################################################
 
     return global_step, tr_loss / global_step
@@ -348,6 +380,9 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument("--master_ip", type=str)
+    parser.add_argument("--master_port", type=str)
+    parser.add_argument("--world_size", type=int, default=4)
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -385,10 +420,16 @@ def main():
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
     
-    ##################################################
-    # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
-    # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
+    # Initialize distributed environment first
+    if args.world_size > 1:
+        dist.init_process_group(
+            backend = 'gloo',  # 'nccl' for gpu
+            init_method = f"tcp://{args.master_ip}:{args.master_port}",
+            world_size = args.world_size,
+            rank = args.local_rank
+        )
 
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
     ##################################################
 
     if args.local_rank == 0:
@@ -397,7 +438,6 @@ def main():
     model.to(args.device)
 
     logger.info("Training/evaluation parameters %s", args)
-
 
     # Training
     if args.do_train:
