@@ -1,8 +1,5 @@
 export GLUE_DIR=/proj/cos568proj2-PG0/glue_data
 export TASK_NAME=RTE
-export ip_address=127.0.0.1
-export port=29500
-export rank=2
 
 python3 run_glue.py \
   --model_type bert \
@@ -14,10 +11,10 @@ python3 run_glue.py \
   --max_seq_length 128 \
   --per_device_train_batch_size 64 \
   --learning_rate 2e-5 \
-  --num_train_epochs 3 \
+  --num_train_epochs 1 \
   --output_dir /tmp/$TASK_NAME/ \
   --overwrite_output_dir \
-  --master_ip $ip_address \
-  --master_port $port \
+  --master_ip 10.10.1.2 \
+  --master_port 29523 \
   --world_size 4 \
-  --local_rank $rank
+  --local_rank 2
