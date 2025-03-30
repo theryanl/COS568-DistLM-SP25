@@ -484,7 +484,7 @@ def main():
 
     model.to(args.device)
 
-    # Wrap model with DistributedDataParallel if using distributed training
+    # part 3: DistributedDataParallel class
     if args.world_size > 1:
         model = DistributedDataParallel(model)
 
